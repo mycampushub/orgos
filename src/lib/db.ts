@@ -1,4 +1,12 @@
 import { PrismaClient } from '@prisma/client'
+// Static import — @prisma/adapter-d1 is pure JS (conditional exports: the
+// `node` entry just imports @prisma/driver-adapter-utils, no Workers-only
+// globals at module top level). We only instantiate it on the Workers
+// runtime, but importing it on Node is harmless and keeps this module
+// FULLY SYNCHRONOUS — top-level await would break the OpenNext edge-runtime
+// polyfill's `__name` helper hoisting (Cloudflare Worker runtime error:
+// "Uncaught ReferenceError: __name is not defined").
+import { PrismaD1 } from '@prisma/adapter-d1'
 
 // M25-db: Prisma client extension for automatic soft-delete filtering.
 // Models with `deletedAt` are automatically filtered to exclude soft-deleted rows
@@ -37,9 +45,9 @@ interface D1DatabaseLike {
  * the OpenNext context global. Returns null on plain Node or when the global
  * hasn't been published yet.
  *
- * We read the global directly (no `@opennextjs/cloudflare/api` import) so the
+ * Reads the global directly (no `@opennextjs/cloudflare/api` import) so the
  * call is synchronous — that lets us build the PrismaClient at module load,
- * which preserves the synchronous `export const db = …` API that every route
+ * which preserves the synchronous `export const db = …` API every route
  * file already relies on (`await db.lead.findMany(…)` etc.).
  */
 function getCloudflareEnvSync(): Record<string, unknown> | null {
@@ -50,27 +58,7 @@ function getCloudflareEnvSync(): Record<string, unknown> | null {
 }
 
 /**
- * Resolve the PrismaD1 adapter class. On the Workers runtime we can statically
- * import `@prisma/adapter-d1` (it's a pure-JS package, no native deps) — but
- * we use a runtime-string specifier + turbopack-ignore comments so that on
- * plain Node (where the package is installed but unused) the bundler doesn't
- * try to resolve it at build time and pull Workers-only code into the Node
- * bundle. The synchronous `await import()` here is fine because module
- * imports are cached after first resolution.
- */
-async function loadPrismaD1Adapter(): Promise<{
-  PrismaD1: new (d1: D1DatabaseLike) => unknown
-}> {
-  const mod = (await import(
-    /* webpackIgnore: true */
-    /* turbopackIgnore: true */
-    '@prisma/adapter-d1'
-  )) as { PrismaD1: new (d1: D1DatabaseLike) => unknown }
-  return mod
-}
-
-/**
- * Build the base PrismaClient for the current runtime.
+ * Build the base PrismaClient for the current runtime — SYNCHRONOUSLY.
  *
  * - Node (local dev / `bun run dev`): plain `new PrismaClient()` against the
  *   SQLite file at db/custom.db (DATABASE_URL in .env).
@@ -80,17 +68,23 @@ async function loadPrismaD1Adapter(): Promise<{
  * Both paths use the SAME generated client from `@prisma/client` — the SQLite
  * schema is 100% D1-compatible (string IDs, no list fields, JSON as String),
  * so one client works for both runtimes. Only the construction differs.
+ *
+ * CRITICAL: this function must stay synchronous. A top-level `await` here
+ * breaks OpenNext's esbuild bundling — the edge-runtime polyfill that
+ * defines `__name` (used to preserve function names for stack traces)
+ * stops being hoisted into the module's scope, and every server module
+ * that uses named functions throws `ReferenceError: __name is not defined`
+ * at runtime on the Worker.
  */
-async function createBaseClient(): Promise<PrismaClient> {
+function createBaseClient(): PrismaClient {
   if (ON_CF) {
     const env = getCloudflareEnvSync()
     const d1 = env?.DATABASE as D1DatabaseLike | undefined
     if (d1 && typeof d1.prepare === 'function') {
-      const { PrismaD1 } = await loadPrismaD1Adapter()
-      const adapter = new PrismaD1(d1)
+      const adapter = new PrismaD1(d1 as Parameters<typeof PrismaD1>[0])
       // `adapter` is the driver-adapter option on PrismaClient constructor.
       // Cast through unknown to satisfy TS without importing the adapter type
-      // at module top-level (which would break Node bundling).
+      // at module top-level (which would pull Workers types into Node).
       return new PrismaClient({ adapter } as ConstructorParameters<typeof PrismaClient>[0])
     }
     console.warn('[db] CF_WORKER=1 but no DATABASE D1 binding — falling back to local SQLite. Queries will likely fail.')
@@ -144,12 +138,13 @@ const globalForPrisma = globalThis as unknown as {
   prisma: ReturnType<typeof withSoftDelete> | undefined
 }
 
-// Top-level await: Next.js App Router server modules support this, and the
-// OpenNext worker entry guarantees the Cloudflare context global is published
-// before any route handler runs. This preserves the synchronous `db.lead.X()`
-// API every call site already uses — no Proxy, no call-site changes.
-const baseClient = globalForPrisma.prisma
-  ?? (await createBaseClient().then(withSoftDelete))
+// Fully synchronous construction — no top-level await, no dynamic import.
+// On Node: `new PrismaClient()` against the local SQLite file.
+// On Workers: `new PrismaClient({ adapter: new PrismaD1(env.DATABASE) })`
+// against the bound D1 database. The OpenNext worker entry publishes the
+// Cloudflare context global BEFORE any route handler runs, so env.DATABASE
+// is available at module-load time.
+const baseClient = globalForPrisma.prisma ?? withSoftDelete(createBaseClient())
 
 if (process.env.NODE_ENV !== 'production' || ON_CF) {
   globalForPrisma.prisma = baseClient
