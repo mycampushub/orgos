@@ -1,4 +1,21 @@
-import { PrismaClient } from '@prisma/client'
+// CRITICAL: import BOTH PrismaClient variants.
+//
+// The default `@prisma/client` resolves to `./default.js` which uses the
+// BINARY query engine (`libquery_engine-*.so.node`). That native binary
+// can't load on Cloudflare Workers (no filesystem, no native addons).
+//
+// `@prisma/client/edge` uses `@prisma/client/runtime/edge.js` which loads
+// the WASM query engine (`query_engine_bg.wasm`). Wasm works on Workers
+// but the edge client can't open local SQLite files (`file:` URLs) — it
+// requires a driver adapter or a `prisma://` URL.
+//
+// Solution: import both. On Node, construct `PrismaClientNode` (binary
+// engine, opens the local SQLite file at DATABASE_URL). On Workers,
+// construct `PrismaClientEdge` (Wasm engine + PrismaD1 adapter). The unused
+// import is tree-shaken; importing is safe — the engine only loads on
+// `new PrismaClient()`, never at import time.
+import { PrismaClient as PrismaClientNode } from '@prisma/client'
+import { PrismaClient as PrismaClientEdge } from '@prisma/client/edge'
 // Static import — @prisma/adapter-d1 is pure JS (conditional exports: the
 // `node` entry just imports @prisma/driver-adapter-utils, no Workers-only
 // globals at module top level). We only instantiate it on the Workers
@@ -83,16 +100,15 @@ function getCloudflareEnvSync(): CloudflareEnv | null {
  * page-data collection, or a misconfigured wrangler.toml). The caller must
  * NOT cache a null result — it would poison all subsequent requests.
  */
-function createBaseClient(): PrismaClient | null {
+function createBaseClient(): PrismaClientNode | PrismaClientEdge | null {
   if (ON_CF) {
     const env = getCloudflareEnvSync()
     const d1 = env?.DATABASE
     if (d1 && typeof d1.prepare === 'function') {
       const adapter = new PrismaD1(d1 as Parameters<typeof PrismaD1>[0])
-      // `adapter` is the driver-adapter option on PrismaClient constructor.
-      // Cast through unknown to satisfy TS without importing the adapter type
-      // at module top-level (which would pull Workers types into Node).
-      return new PrismaClient({ adapter } as ConstructorParameters<typeof PrismaClient>[0])
+      // Workers: use the EDGE client (Wasm engine + D1 adapter). The default
+      // client's binary engine can't load on Workers (no filesystem).
+      return new PrismaClientEdge({ adapter } as ConstructorParameters<typeof PrismaClientEdge>[0])
     }
     // No D1 binding available right now — return null so the caller knows
     // not to cache. This happens during `next build` page-data collection
@@ -100,13 +116,18 @@ function createBaseClient(): PrismaClient | null {
     // poison the global cache if we constructed a plain PrismaClient here.
     return null
   }
-  // Node path: always works (SQLite file at DATABASE_URL).
-  return new PrismaClient({ log: ['query'] })
+  // Node path: use the DEFAULT client (binary engine, opens SQLite file at
+  // DATABASE_URL). The edge client can't open `file:` URLs.
+  return new PrismaClientNode({ log: ['query'] })
 }
+
+// The type of whichever client is built — both PrismaClientNode and
+// PrismaClientEdge have the same API surface ($extends, findMany, etc.)
+type AnyPrismaClient = PrismaClientNode | PrismaClientEdge
 
 // The soft-delete extension is applied to whichever client we build (Node or
 // D1-backed) — it's a pure query-interception layer, runtime-agnostic.
-function withSoftDelete(client: PrismaClient) {
+function withSoftDelete(client: AnyPrismaClient) {
   return client.$extends({
     query: Object.fromEntries(
       SOFT_DELETE_MODELS.map((model) => [
