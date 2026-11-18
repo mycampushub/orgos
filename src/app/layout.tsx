@@ -74,6 +74,29 @@ export default function RootLayout({
 }>) {
   return (
     <html lang="en" suppressHydrationWarning>
+      <head>
+        {/*
+         * __name polyfill — MUST run before any inline script.
+         *
+         * When OpenNext/esbuild bundles the app with `keepNames: true`, it
+         * injects `__name(fn, "name")` calls into function bodies to preserve
+         * their `.name` property. This is fine inside bundled modules (where
+         * esbuild also defines `__name`), but `next-themes` serializes one of
+         * its internal functions to a string via `.toString()` and injects it
+         * as an inline `<script>` tag. That script runs in the browser's
+         * global scope, where `__name` is NOT defined — so it throws
+         * `ReferenceError: __name is not defined` and crashes the page.
+         *
+         * Defining `window.__name` as a no-op (returns the function unchanged)
+         * makes the inline script work. This runs in <head> before any
+         * inline script in <body>.
+         */}
+        <script
+          dangerouslySetInnerHTML={{
+            __html: 'window.__name||(window.__name=function(f){return f});',
+          }}
+        />
+      </head>
       <body
         className={`${geistSans.variable} ${geistMono.variable} antialiased bg-background text-foreground`}
       >
