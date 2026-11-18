@@ -31,8 +31,14 @@ const ON_CF = process.env.CF_WORKER === '1'
 
 /**
  * The OpenNext worker entry (production) and initOpenNextCloudflareForDev
- * (`cf:dev`) publish the request context on this global before any route
- * handler runs — same symbol/pattern as src/lib/server/storage.ts.
+ * (`cf:dev`) publish the request context on this global via AsyncLocalStorage
+ * — see .open-next/cloudflare/init.js. The getter returns the ALS store, which
+ * is populated ONLY inside `runWithCloudflareRequestContext(request, env, ctx, handler)`.
+ *
+ * CRITICAL: at build time (next build's "Collecting page data" phase), route
+ * modules are imported to collect metadata — but there's no request, so the
+ * ALS store is undefined and this returns null. We must NOT cache a broken
+ * (plain PrismaClient) at module-load time; we construct lazily on first use.
  */
 const CF_CONTEXT_SYMBOL = Symbol.for('__cloudflare-context__')
 
@@ -40,19 +46,20 @@ interface D1DatabaseLike {
   prepare(query: string): unknown
 }
 
+interface CloudflareEnv {
+  DATABASE?: D1DatabaseLike
+  [key: string]: unknown
+}
+
 /**
- * Synchronously resolve the Cloudflare env (bindings + vars + secrets) from
- * the OpenNext context global. Returns null on plain Node or when the global
- * hasn't been published yet.
- *
- * Reads the global directly (no `@opennextjs/cloudflare/api` import) so the
- * call is synchronous — that lets us build the PrismaClient at module load,
- * which preserves the synchronous `export const db = …` API every route
- * file already relies on (`await db.lead.findMany(…)` etc.).
+ * Synchronously read the Cloudflare env from the OpenNext context global.
+ * Returns null when not on Workers OR when called outside a request context
+ * (e.g. during `next build`'s page-data collection phase, or in a Node dev
+ * server). The caller must handle null by falling back to the local path.
  */
-function getCloudflareEnvSync(): Record<string, unknown> | null {
+function getCloudflareEnvSync(): CloudflareEnv | null {
   const globalCtx = (globalThis as Record<symbol, unknown>)[CF_CONTEXT_SYMBOL] as
-    | { env?: Record<string, unknown> }
+    | { env?: CloudflareEnv }
     | undefined
   return globalCtx?.env ?? null
 }
@@ -65,21 +72,21 @@ function getCloudflareEnvSync(): Record<string, unknown> | null {
  * - Cloudflare Workers (production / `cf:dev`): `new PrismaClient({ adapter })`
  *   with the PrismaD1 driver adapter bound to the DATABASE D1 binding.
  *
- * Both paths use the SAME generated client from `@prisma/client` — the SQLite
- * schema is 100% D1-compatible (string IDs, no list fields, JSON as String),
- * so one client works for both runtimes. Only the construction differs.
- *
  * CRITICAL: this function must stay synchronous. A top-level `await` here
  * breaks OpenNext's esbuild bundling — the edge-runtime polyfill that
  * defines `__name` (used to preserve function names for stack traces)
  * stops being hoisted into the module's scope, and every server module
  * that uses named functions throws `ReferenceError: __name is not defined`
  * at runtime on the Worker.
+ *
+ * Returns null when on Workers but no D1 binding is available (build-time
+ * page-data collection, or a misconfigured wrangler.toml). The caller must
+ * NOT cache a null result — it would poison all subsequent requests.
  */
-function createBaseClient(): PrismaClient {
+function createBaseClient(): PrismaClient | null {
   if (ON_CF) {
     const env = getCloudflareEnvSync()
-    const d1 = env?.DATABASE as D1DatabaseLike | undefined
+    const d1 = env?.DATABASE
     if (d1 && typeof d1.prepare === 'function') {
       const adapter = new PrismaD1(d1 as Parameters<typeof PrismaD1>[0])
       // `adapter` is the driver-adapter option on PrismaClient constructor.
@@ -87,8 +94,13 @@ function createBaseClient(): PrismaClient {
       // at module top-level (which would pull Workers types into Node).
       return new PrismaClient({ adapter } as ConstructorParameters<typeof PrismaClient>[0])
     }
-    console.warn('[db] CF_WORKER=1 but no DATABASE D1 binding — falling back to local SQLite. Queries will likely fail.')
+    // No D1 binding available right now — return null so the caller knows
+    // not to cache. This happens during `next build` page-data collection
+    // (where route modules are imported without a request context) and would
+    // poison the global cache if we constructed a plain PrismaClient here.
+    return null
   }
+  // Node path: always works (SQLite file at DATABASE_URL).
   return new PrismaClient({ log: ['query'] })
 }
 
@@ -130,24 +142,95 @@ function withSoftDelete(client: PrismaClient) {
   })
 }
 
-// ---------- client singleton ----------
+// ---------- client singleton (lazy + cache-safe) ----------
 // PrismaClient must be reused across hot-reloads (dev) and across requests
 // (Workers isolate) — otherwise every request opens a new connection pool and
-// exhausts D1's connection limit. Cache on globalThis so it survives HMR.
+// exhausts D1's connection limit.
+//
+// BUT: on Workers, the D1 binding is only available inside a request context
+// (set by OpenNext's runWithCloudflareRequestContext). At module-load time
+// during `next build`'s page-data collection phase, there's no request, so
+// getCloudflareEnvSync() returns null and createBaseClient() returns null.
+// If we cached that null (or a plain PrismaClient fallback) on globalThis,
+// every subsequent real request would reuse the broken cached client.
+//
+// Solution: the `db` export is a Proxy that lazily constructs the client on
+// first property access — which only happens inside a request handler, where
+// the D1 binding IS available. The constructed client is then cached on
+// globalThis for reuse across requests in the same isolate.
+type ExtendedClient = ReturnType<typeof withSoftDelete>
+
 const globalForPrisma = globalThis as unknown as {
-  prisma: ReturnType<typeof withSoftDelete> | undefined
+  prisma: ExtendedClient | undefined
 }
 
-// Fully synchronous construction — no top-level await, no dynamic import.
-// On Node: `new PrismaClient()` against the local SQLite file.
-// On Workers: `new PrismaClient({ adapter: new PrismaD1(env.DATABASE) })`
-// against the bound D1 database. The OpenNext worker entry publishes the
-// Cloudflare context global BEFORE any route handler runs, so env.DATABASE
-// is available at module-load time.
-const baseClient = globalForPrisma.prisma ?? withSoftDelete(createBaseClient())
-
-if (process.env.NODE_ENV !== 'production' || ON_CF) {
-  globalForPrisma.prisma = baseClient
+function buildAndCacheClient(): ExtendedClient {
+  const base = createBaseClient()
+  if (base === null) {
+    // Should never happen at request time on a correctly-configured Worker.
+    // If it does, throw a clear error instead of silently falling back to a
+    // broken plain PrismaClient (which would 500 on every DB query anyway).
+    throw new Error(
+      '[db] CF_WORKER=1 but no DATABASE D1 binding available. ' +
+        'Ensure wrangler.toml [[d1_databases]] binding = "DATABASE" is set and the database_id is real.'
+    )
+  }
+  const extended = withSoftDelete(base)
+  // Cache on globalThis so the client survives HMR (Node dev) and isolate
+  // reuse (Workers prod). Skip caching in Node production (fresh per process).
+  if (process.env.NODE_ENV !== 'production' || ON_CF) {
+    globalForPrisma.prisma = extended
+  }
+  return extended
 }
 
-export const db = baseClient
+/**
+ * The OrgOS database client.
+ *
+ * - On Node (`bun run dev`): a plain PrismaClient against the local SQLite
+ *   file, wrapped in the soft-delete extension.
+ * - On Cloudflare Workers: a PrismaClient backed by the PrismaD1 driver
+ *   adapter bound to the DATABASE D1 binding, wrapped in the same soft-delete
+ *   extension.
+ *
+ * LAZY: the underlying client is constructed on first property access, not at
+ * module load. This is critical on Workers — at `next build` time, route
+ * modules are imported to collect page data, but there's no request context
+ * so the D1 binding isn't available yet. Constructing eagerly would cache a
+ * broken plain PrismaClient on globalThis and poison every subsequent
+ * request. By deferring to first property access (which only happens inside
+ * a request handler), we guarantee the D1 binding is available.
+ *
+ * Type-safe: typed as the extended PrismaClient, so all model delegates
+ * (`db.lead`, `db.user`, …), `$transaction`, `$queryRaw`, etc. are fully
+ * type-checked at compile time.
+ *
+ * Usage is unchanged: `await db.lead.findMany(...)`, `await db.$transaction(async (tx) => ...)`, etc.
+ */
+export const db = (new Proxy(
+  // The target is an empty object — every property access forwards to the
+  // real (lazily-constructed) client. `get` is the only trap we need because
+  // PrismaClient's API is entirely method/property reads.
+  {},
+  {
+    get(_target, prop) {
+      // Skip well-known non-string / Promise-coercion symbols. These would
+      // otherwise trigger client construction unnecessarily (e.g. `await db`
+      // would call get(_, 'then'), which we don't want).
+      if (
+        typeof prop !== 'string' ||
+        prop === 'then' ||
+        prop === 'catch' ||
+        prop === 'finally' ||
+        prop === 'toJSON' ||
+        prop === Symbol.toPrimitive ||
+        prop === 'constructor'
+      ) {
+        return undefined
+      }
+      // Use the cached client if available; otherwise build + cache.
+      const client = globalForPrisma.prisma ?? buildAndCacheClient()
+      return (client as unknown as Record<string, unknown>)[prop]
+    },
+  }
+) as unknown) as ExtendedClient
