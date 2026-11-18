@@ -25,7 +25,6 @@ migrations_table = "__cf_d1_migrations"
 [[r2_buckets]]
 binding = "BUCKET"
 bucket_name = "orgos-documents"
-jurisdiction = "default"
 
 # ---- KV: hot caches + session/token lookups ----
 [[kv_namespaces]]
