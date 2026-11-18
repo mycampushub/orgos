@@ -1,0 +1,1115 @@
+'use client'
+
+import { useMemo, useState } from 'react'
+import { useData, api, apiForm } from '@/lib/client/api'
+import { useWorkspace } from '@/lib/client/store'
+import { PageHeader, EmptyState } from '@/components/app/page-header'
+import { StatCard } from '@/components/app/stat-card'
+import { UserAvatar } from '@/components/app/user-avatar'
+import { Badge } from '@/components/ui/badge'
+import { Button } from '@/components/ui/button'
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from '@/components/ui/dialog'
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from '@/components/ui/alert-dialog'
+import { Input } from '@/components/ui/input'
+import { Label } from '@/components/ui/label'
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from '@/components/ui/select'
+import { Skeleton } from '@/components/ui/skeleton'
+import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
+import { Textarea } from '@/components/ui/textarea'
+import { toast } from '@/hooks/use-toast'
+import { cn } from '@/lib/utils'
+import { fmtDate, relativeTime } from '@/lib/format'
+import {
+  CloudUpload,
+  Download,
+  Eye,
+  File,
+  FileText,
+  FileType,
+  Folder,
+  FolderInput,
+  FolderOpen,
+  HardDrive,
+  Info,
+  Loader2,
+  Pencil,
+  Search,
+  Sheet,
+  Trash2,
+  TriangleAlert,
+  Image as ImageIcon,
+} from 'lucide-react'
+
+// ---------- local types (API shapes from worklog T1-d) ----------
+
+interface MemberRef {
+  id: string
+  role: string
+  title: string | null
+  user: { id: string; name: string; avatarUrl: string | null }
+}
+
+interface DocItem {
+  id: string
+  orgId: string
+  projectId: string | null
+  folder: string
+  name: string
+  mimeType: string | null
+  size: number | null
+  storageKey: string | null
+  version: number
+  uploadedById: string | null
+  createdAt: string
+  project: { id: string; name: string; color: string | null } | null
+  uploadedBy: MemberRef | null
+  uploadedByName: string | null
+}
+
+interface DocumentsData {
+  items: DocItem[]
+  folders: string[]
+}
+
+interface ProjectLite {
+  id: string
+  name: string
+  color: string | null
+}
+
+// ---------- helpers ----------
+
+type DocKind = 'pdf' | 'word' | 'excel' | 'image' | 'other'
+
+function docKind(mimeType: string | null, name: string): DocKind {
+  const mt = (mimeType ?? '').toLowerCase()
+  if (mt.includes('pdf') || /\.pdf$/i.test(name)) return 'pdf'
+  if (mt.includes('word') || mt.includes('document') || /\.(docx?|rtf)$/i.test(name)) return 'word'
+  if (mt.includes('sheet') || mt.includes('excel') || mt.includes('csv') || /\.(xlsx?|csv)$/i.test(name)) return 'excel'
+  if (mt.startsWith('image/') || /\.(png|jpe?g|gif|svg|webp|fig)$/i.test(name)) return 'image'
+  return 'other'
+}
+
+const KIND_META: Record<DocKind, { icon: typeof FileText; tile: string; label: string }> = {
+  pdf: { icon: FileText, tile: 'bg-rose-500/10 text-rose-600 dark:text-rose-400', label: 'PDF' },
+  word: { icon: FileType, tile: 'bg-amber-500/10 text-amber-600 dark:text-amber-400', label: 'Word' },
+  excel: { icon: Sheet, tile: 'bg-emerald-500/10 text-emerald-600 dark:text-emerald-400', label: 'Excel' },
+  image: { icon: ImageIcon, tile: 'bg-teal-500/10 text-teal-600 dark:text-teal-300', label: 'Image' },
+  other: { icon: File, tile: 'bg-muted text-muted-foreground', label: 'File' },
+}
+
+/** Bytes (API) → human size. */
+function fmtSize(bytes: number | null | undefined): string {
+  if (bytes === null || bytes === undefined || Number.isNaN(bytes)) return '—'
+  if (bytes < 1024) return `${bytes} B`
+  const kb = bytes / 1024
+  if (kb < 1024) return `${kb.toFixed(kb >= 100 ? 0 : 1)} KB`
+  const mb = kb / 1024
+  if (mb < 1024) return `${mb.toFixed(mb >= 100 ? 0 : 1)} MB`
+  return `${(mb / 1024).toFixed(1)} GB`
+}
+
+const MIMETYPE_OPTIONS: Array<{ value: DocKind; label: string; mime: string | undefined }> = [
+  { value: 'pdf', label: 'PDF document', mime: 'application/pdf' },
+  { value: 'word', label: 'Word document', mime: 'application/msword' },
+  { value: 'excel', label: 'Excel spreadsheet', mime: 'application/vnd.ms-excel' },
+  { value: 'image', label: 'Image', mime: 'image/png' },
+  { value: 'other', label: 'Other', mime: undefined },
+]
+
+/** Client-side mirror of the server MIME allowlist (src/lib/server/storage.ts —
+ *  the view cannot import that module directly, it pulls in fs/promises). */
+const ALLOWED_MIME_LIST = [
+  'application/pdf',
+  'image/png',
+  'image/jpeg',
+  'image/webp',
+  'image/gif',
+  'text/plain',
+  'text/csv',
+  'application/msword',
+  'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+  'application/vnd.ms-excel',
+  'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+  'application/zip',
+  'application/json',
+]
+
+const ALLOWED_MIME_SET = new Set<string>(ALLOWED_MIME_LIST)
+
+/** Common browser/OS aliases normalized onto the canonical allowlist entries. */
+const MIME_ALIASES: Record<string, string> = {
+  'image/jpg': 'image/jpeg',
+  'application/x-zip-compressed': 'application/zip',
+  'text/x-csv': 'text/csv',
+}
+
+/** Extension → allowlist mime, for browsers that report an empty File.type. */
+const MIME_BY_EXTENSION: Record<string, string> = {
+  pdf: 'application/pdf',
+  png: 'image/png',
+  jpg: 'image/jpeg',
+  jpeg: 'image/jpeg',
+  webp: 'image/webp',
+  gif: 'image/gif',
+  txt: 'text/plain',
+  csv: 'text/csv',
+  doc: 'application/msword',
+  docx: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+  xls: 'application/vnd.ms-excel',
+  xlsx: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+  zip: 'application/zip',
+  json: 'application/json',
+}
+
+const ACCEPT_MIME = ALLOWED_MIME_LIST.join(',')
+
+/** M13-ui: client-side MIME validation — mirrors server-side isAllowedMimeType.
+ *  Browsers sometimes report an empty File.type, so we fall back to extension. */
+function isAllowedClientFile(file: File): boolean {
+  const declared = (file.type ?? '').trim().toLowerCase()
+  if (declared) {
+    return ALLOWED_MIME_SET.has(MIME_ALIASES[declared] ?? declared)
+  }
+  const ext = file.name.split('.').pop()?.toLowerCase() ?? ''
+  return !!MIME_BY_EXTENSION[ext]
+}
+
+/** Client mirror of MAX_UPLOAD_BYTES — the server re-validates. */
+const MAX_FILE_BYTES = 25 * 1024 * 1024
+
+const NEW_FOLDER = '__new__'
+const DEFAULT_FOLDER = '__default__'
+const NO_PROJECT = 'none'
+
+// ---------- view ----------
+
+export default function DocumentsView() {
+  const { membership, role, can } = useWorkspace()
+  const { data, loading, error, refresh } = useData<DocumentsData>('/api/documents')
+  const { data: projectsData } = useData<{ items: ProjectLite[] }>('/api/projects')
+
+  const [folder, setFolder] = useState<string | null>(null) // null = All files
+  const [q, setQ] = useState('')
+  const [projectFilter, setProjectFilter] = useState<string>(NO_PROJECT)
+
+  // upload dialog
+  const [uploadOpen, setUploadOpen] = useState(false)
+  const [mode, setMode] = useState<'upload' | 'link'>('upload')
+  const [file, setFile] = useState<File | null>(null)
+  // M12-ui/M13-ui: inline file-picker error (oversize or unsupported MIME).
+  const [fileError, setFileError] = useState<string | null>(null)
+  const [form, setForm] = useState({
+    name: '',
+    folderChoice: DEFAULT_FOLDER,
+    newFolder: '',
+    projectId: NO_PROJECT,
+    kind: 'pdf' as DocKind,
+    sizeKb: '',
+    notes: '',
+  })
+  const [saving, setSaving] = useState(false)
+
+  const [detailsDoc, setDetailsDoc] = useState<DocItem | null>(null)
+  const [deleteDoc, setDeleteDoc] = useState<DocItem | null>(null)
+  const [deleting, setDeleting] = useState(false)
+
+  // rename + move-to-project state (small dialogs launched from the details footer)
+  const [renameDoc, setRenameDoc] = useState<DocItem | null>(null)
+  const [renameName, setRenameName] = useState('')
+  const [renameSaving, setRenameSaving] = useState(false)
+  const [moveDoc, setMoveDoc] = useState<DocItem | null>(null)
+  const [moveProjectId, setMoveProjectId] = useState<string>(NO_PROJECT)
+  const [moveSaving, setMoveSaving] = useState(false)
+
+  const items = data?.items ?? []
+  const folders = data?.folders ?? []
+  const projects = projectsData?.items ?? []
+
+  const folderCounts = useMemo(() => {
+    const map = new Map<string, number>()
+    for (const d of items) map.set(d.folder, (map.get(d.folder) ?? 0) + 1)
+    return map
+  }, [items])
+
+  const docProjects = useMemo(() => {
+    const map = new Map<string, ProjectLite>()
+    for (const d of items) if (d.project) map.set(d.project.id, d.project)
+    return [...map.values()]
+  }, [items])
+
+  const visible = useMemo(() => {
+    const needle = q.trim().toLowerCase()
+    return items.filter(
+      (d) =>
+        (folder === null || d.folder === folder) &&
+        (projectFilter === NO_PROJECT || d.projectId === projectFilter) &&
+        (!needle || d.name.toLowerCase().includes(needle))
+    )
+  }, [items, folder, projectFilter, q])
+
+  const totalSize = useMemo(() => items.reduce((sum, d) => sum + (d.size ?? 0), 0), [items])
+
+  const canDelete = (d: DocItem) =>
+    !!membership && (d.uploadedById === membership.id || role === 'OWNER' || role === 'ADMIN')
+
+  /** documents FULL access — matches the PATCH /api/documents/[id] server gate.
+   *  Unlike canDelete, this is an org-level capability (no per-doc ownership check). */
+  const canEditDoc = can('documents')
+
+  const openUpload = () => {
+    setForm((f) => ({ ...f, name: '', newFolder: '', sizeKb: '', notes: '', folderChoice: DEFAULT_FOLDER, projectId: NO_PROJECT, kind: 'pdf' }))
+    setFile(null)
+    setFileError(null)
+    setMode('upload')
+    setUploadOpen(true)
+  }
+
+  const submitUpload = async () => {
+    const folderName =
+      form.folderChoice === NEW_FOLDER
+        ? form.newFolder.trim()
+        : form.folderChoice === DEFAULT_FOLDER
+          ? 'General'
+          : form.folderChoice || 'General'
+    if (form.folderChoice === NEW_FOLDER && !folderName) {
+      toast({ title: 'Folder name required', description: 'Enter a name for the new folder.', variant: 'destructive' })
+      return
+    }
+    const name = form.name.trim()
+    if (!name) {
+      toast({ title: 'Name required', description: 'Give the document a file name.', variant: 'destructive' })
+      return
+    }
+    if (mode === 'upload' && !file) {
+      toast({ title: 'File required', description: 'Choose a file to upload first.', variant: 'destructive' })
+      return
+    }
+    if (mode === 'upload' && file && file.size > MAX_FILE_BYTES) {
+      toast({ title: 'File too large', description: 'Maximum upload size is 25 MB.', variant: 'destructive' })
+      return
+    }
+
+    setSaving(true)
+    try {
+      if (mode === 'upload' && file) {
+        const fd = new FormData()
+        fd.append('file', file)
+        fd.append('name', name)
+        fd.append('folder', folderName)
+        if (form.notes.trim()) fd.append('notes', form.notes.trim())
+        if (form.projectId !== NO_PROJECT) fd.append('projectId', form.projectId)
+        await apiForm('/api/documents', fd)
+        toast({ title: 'File uploaded', description: `${name} (${fmtSize(file.size)}) stored in ${folderName}.` })
+      } else {
+        const mime = MIMETYPE_OPTIONS.find((o) => o.value === form.kind)?.mime
+        const kb = Number(form.sizeKb)
+        await api('/api/documents', {
+          method: 'POST',
+          body: {
+            name,
+            folder: folderName,
+            projectId: form.projectId === NO_PROJECT ? undefined : form.projectId,
+            mimeType: mime,
+            size: form.sizeKb.trim() !== '' && !Number.isNaN(kb) ? Math.round(kb * 1024) : undefined,
+          },
+        })
+        toast({ title: 'Document registered', description: `${name} added to ${folderName} (metadata only).` })
+      }
+      setUploadOpen(false)
+      refresh()
+    } catch {
+      /* api()/apiForm() already toasts */
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  const confirmDelete = async () => {
+    if (!deleteDoc) return
+    const doc = deleteDoc
+    setDeleting(true)
+    try {
+      await api(`/api/documents/${doc.id}`, { method: 'DELETE' })
+      // M15-fe: undo toast
+      toast({
+        title: 'Document deleted',
+        description: `${doc.name} was removed from the library.`,
+        duration: 5000,
+        action: {
+          label: 'Undo',
+          onClick: () => {
+            api(`/api/documents/${doc.id}/restore`, { method: 'POST', silent: true })
+              .then(() => { toast({ title: 'Document restored' }); refresh() })
+              .catch(() => toast({ title: 'Could not restore', variant: 'destructive' }))
+          },
+        },
+      })
+      setDeleteDoc(null)
+      setDetailsDoc(null)
+      refresh()
+    } catch {
+      /* api() already toasts */
+    } finally {
+      setDeleting(false)
+    }
+  }
+
+  const openRename = (d: DocItem) => {
+    setRenameDoc(d)
+    setRenameName(d.name)
+  }
+
+  const submitRename = async () => {
+    if (!renameDoc) return
+    const name = renameName.trim()
+    if (!name) {
+      toast({ title: 'Name required', description: 'Enter a new file name.', variant: 'destructive' })
+      return
+    }
+    if (name === renameDoc.name) {
+      // nothing to do — close without a request
+      setRenameDoc(null)
+      return
+    }
+    setRenameSaving(true)
+    try {
+      await api(`/api/documents/${renameDoc.id}`, { method: 'PATCH', body: { name } })
+      toast({ title: 'Document renamed', description: `Now "${name}".` })
+      // keep the details dialog in sync if it was open
+      if (detailsDoc?.id === renameDoc.id) setDetailsDoc({ ...detailsDoc, name })
+      setRenameDoc(null)
+      refresh()
+    } catch {
+      /* api() already toasts */
+    } finally {
+      setRenameSaving(false)
+    }
+  }
+
+  const openMove = (d: DocItem) => {
+    setMoveDoc(d)
+    setMoveProjectId(d.projectId ?? NO_PROJECT)
+  }
+
+  const submitMove = async () => {
+    if (!moveDoc) return
+    const nextProjectId = moveProjectId === NO_PROJECT ? null : moveProjectId
+    if ((nextProjectId ?? null) === (moveDoc.projectId ?? null)) {
+      // no change — close without a request
+      setMoveDoc(null)
+      return
+    }
+    setMoveSaving(true)
+    try {
+      await api(`/api/documents/${moveDoc.id}`, {
+        method: 'PATCH',
+        body: { projectId: nextProjectId },
+      })
+      const projectName = nextProjectId ? projects.find((p) => p.id === nextProjectId)?.name ?? 'project' : 'unfiled'
+      toast({ title: 'Document moved', description: `"${moveDoc.name}" is now in ${projectName}.` })
+      // keep the details dialog in sync if it was open
+      if (detailsDoc?.id === moveDoc.id) {
+        const proj = nextProjectId ? projects.find((p) => p.id === nextProjectId) ?? null : null
+        setDetailsDoc({ ...detailsDoc, projectId: nextProjectId, project: proj })
+      }
+      setMoveDoc(null)
+      refresh()
+    } catch {
+      /* api() already toasts */
+    } finally {
+      setMoveSaving(false)
+    }
+  }
+
+  const hasFilters = folder !== null || projectFilter !== NO_PROJECT || q.trim() !== ''
+  const clearFilters = () => {
+    setFolder(null)
+    setProjectFilter(NO_PROJECT)
+    setQ('')
+  }
+
+  return (
+    <div className="flex flex-col gap-6">
+      <PageHeader
+        icon={FolderOpen}
+        title="Documents"
+        description="Organization library — every file, organized and searchable"
+        actions={
+          <Button onClick={openUpload}>
+            <CloudUpload className="size-4" aria-hidden />
+            Upload document
+          </Button>
+        }
+      />
+
+      {/* stats */}
+      <div className="grid grid-cols-1 gap-4 sm:grid-cols-3">
+        <StatCard label="Total files" value={items.length} sub="across all folders" icon={FileText} loading={loading} />
+        <StatCard
+          label="Folders"
+          value={folders.length}
+          sub={folders.slice(0, 3).join(', ') + (folders.length > 3 ? '…' : '') || '—'}
+          icon={Folder}
+          tone="success"
+          loading={loading}
+        />
+        <StatCard label="Library size" value={fmtSize(totalSize)} sub="across the library" icon={HardDrive} tone="warning" loading={loading} />
+      </div>
+
+      {loading && !data ? (
+        <div className="flex flex-col gap-3">
+          {Array.from({ length: 5 }).map((_, i) => (
+            <Skeleton key={i} className="h-16 w-full rounded-lg" />
+          ))}
+        </div>
+      ) : error ? (
+        <EmptyState icon={TriangleAlert} title="Could not load documents" description={error} />
+      ) : items.length === 0 ? (
+        <EmptyState
+          icon={FolderOpen}
+          title="No documents yet"
+          description="Upload the first contract, policy or spec — every member of the organization can browse the library."
+          action={
+            <Button onClick={openUpload}>
+              <CloudUpload className="size-4" aria-hidden />
+              Upload document
+            </Button>
+          }
+        />
+      ) : (
+        <div className="grid gap-6 lg:grid-cols-[200px_minmax(0,1fr)]">
+          {/* folder rail — horizontal chips on mobile, vertical rail on desktop */}
+          <nav aria-label="Document folders" className="flex flex-wrap gap-2 lg:flex-col lg:flex-nowrap">
+            <button
+              type="button"
+              onClick={() => setFolder(null)}
+              aria-current={folder === null}
+              className={cn(
+                'flex min-h-11 flex-1 items-center justify-center gap-2 rounded-lg border px-3 py-2 text-sm font-medium transition-colors lg:justify-start lg:flex-none',
+                folder === null
+                  ? 'border-emerald-600/30 bg-emerald-600/10 text-emerald-700 dark:text-emerald-400'
+                  : 'border-border text-foreground hover:bg-muted/60'
+              )}
+            >
+              <FolderOpen className="size-4 shrink-0" aria-hidden />
+              <span className="truncate">All files</span>
+              <span className="ml-auto text-xs text-muted-foreground">{items.length}</span>
+            </button>
+            {folders.map((f) => {
+              const active = folder === f
+              return (
+                <button
+                  key={f}
+                  type="button"
+                  onClick={() => setFolder(active ? null : f)}
+                  aria-current={active}
+                  className={cn(
+                    'flex min-h-11 flex-1 items-center justify-center gap-2 rounded-lg border px-3 py-2 text-sm font-medium transition-colors lg:justify-start lg:flex-none',
+                    active
+                      ? 'border-emerald-600/30 bg-emerald-600/10 text-emerald-700 dark:text-emerald-400'
+                      : 'border-border text-foreground hover:bg-muted/60'
+                  )}
+                >
+                  <Folder className="size-4 shrink-0" aria-hidden />
+                  <span className="truncate">{f}</span>
+                  <span className="ml-auto text-xs text-muted-foreground">{folderCounts.get(f) ?? 0}</span>
+                </button>
+              )
+            })}
+          </nav>
+
+          {/* main area */}
+          <div className="flex min-w-0 flex-col gap-4">
+            {/* filters */}
+            <div className="flex flex-col gap-3 sm:flex-row sm:items-center">
+              <div className="relative flex-1">
+                <Search className="pointer-events-none absolute top-1/2 left-3 size-4 -translate-y-1/2 text-muted-foreground" aria-hidden />
+                <Input
+                  value={q}
+                  onChange={(e) => setQ(e.target.value)}
+                  placeholder="Search by file name…"
+                  aria-label="Search documents by name"
+                  className="pl-9"
+                />
+              </div>
+              <Select value={projectFilter} onValueChange={setProjectFilter}>
+                <SelectTrigger className="w-full sm:w-52" aria-label="Filter by project">
+                  <SelectValue placeholder="All projects" />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value={NO_PROJECT}>All projects</SelectItem>
+                  {docProjects.map((p) => (
+                    <SelectItem key={p.id} value={p.id}>
+                      {p.name}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </div>
+
+            {/* list */}
+            {visible.length === 0 ? (
+              <EmptyState
+                icon={Search}
+                title="No matching documents"
+                description="No files match the current folder, project or search."
+                action={
+                  hasFilters ? (
+                    <Button variant="outline" onClick={clearFilters}>
+                      Clear filters
+                    </Button>
+                  ) : undefined
+                }
+              />
+            ) : (
+              <ul className="flex flex-col gap-2" role="list">
+                {visible.map((d) => {
+                  const kind = docKind(d.mimeType, d.name)
+                  const KindIcon = KIND_META[kind].icon
+                  return (
+                    <li
+                      key={d.id}
+                      className="flex items-center gap-3 rounded-lg border bg-card p-3 transition-shadow hover:shadow-sm sm:p-4"
+                    >
+                      <div className={cn('flex size-10 shrink-0 items-center justify-center rounded-lg', KIND_META[kind].tile)}>
+                        <KindIcon className="size-5" aria-hidden />
+                      </div>
+                      <div className="min-w-0 flex-1">
+                        <div className="flex flex-wrap items-center gap-2">
+                          <p className="truncate text-sm font-medium">{d.name}</p>
+                          {d.version > 1 && (
+                            <Badge variant="outline" className="px-1.5 text-[10px] text-muted-foreground">
+                              v{d.version}
+                            </Badge>
+                          )}
+                        </div>
+                        <div className="mt-1 flex flex-wrap items-center gap-x-2 gap-y-1 text-xs text-muted-foreground">
+                          <Badge variant="secondary" className="max-w-28 truncate px-1.5 text-[10px] font-medium">
+                            {d.folder}
+                          </Badge>
+                          {d.project && (
+                            <span className="inline-flex min-w-0 items-center gap-1">
+                              <span
+                                className="size-2 shrink-0 rounded-full"
+                                style={{ backgroundColor: d.project.color ?? '#10b981' }}
+                                aria-hidden
+                              />
+                              <span className="truncate">{d.project.name}</span>
+                            </span>
+                          )}
+                          <span className="hidden sm:inline" aria-hidden>
+                            ·
+                          </span>
+                          <span>{fmtSize(d.size)}</span>
+                          <span aria-hidden>·</span>
+                          <span className="inline-flex min-w-0 items-center gap-1">
+                            <UserAvatar name={d.uploadedByName} avatarUrl={d.uploadedBy?.user.avatarUrl} size="xs" />
+                            <span className="truncate">{d.uploadedByName ?? 'Former member'}</span>
+                          </span>
+                          <span aria-hidden>·</span>
+                          <span title={fmtDate(d.createdAt)}>{relativeTime(d.createdAt)}</span>
+                        </div>
+                      </div>
+                      <div className="flex shrink-0 items-center gap-1">
+                        {d.storageKey && (
+                          <Button asChild variant="ghost" size="icon" className="size-11 text-muted-foreground hover:text-foreground sm:size-9">
+                            <a href={`/api/documents/${d.id}/download`} download aria-label={`Download ${d.name}`}>
+                              <Download className="size-4" aria-hidden />
+                            </a>
+                          </Button>
+                        )}
+                        <Button
+                          variant="ghost"
+                          size="icon"
+                          className="size-11 text-muted-foreground hover:text-foreground sm:size-9"
+                          onClick={() => setDetailsDoc(d)}
+                          aria-label={`View details of ${d.name}`}
+                        >
+                          <Eye className="size-4" aria-hidden />
+                        </Button>
+                        {canDelete(d) && (
+                          <Button
+                            variant="ghost"
+                            size="icon"
+                            className="size-11 text-muted-foreground hover:text-destructive sm:size-9"
+                            onClick={() => setDeleteDoc(d)}
+                            aria-label={`Delete ${d.name}`}
+                          >
+                            <Trash2 className="size-4" aria-hidden />
+                          </Button>
+                        )}
+                      </div>
+                    </li>
+                  )
+                })}
+              </ul>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* upload dialog */}
+      <Dialog open={uploadOpen} onOpenChange={setUploadOpen}>
+        <DialogContent className="sm:max-w-lg">
+          <DialogHeader>
+            <DialogTitle>Add document</DialogTitle>
+            <DialogDescription>Upload a real file, or register metadata only.</DialogDescription>
+          </DialogHeader>
+          <div className="flex flex-col gap-4">
+            <Tabs value={mode} onValueChange={(v) => { setMode(v === 'link' ? 'link' : 'upload'); setFileError(null) }}>
+              <TabsList className="grid w-full grid-cols-2">
+                <TabsTrigger value="upload">
+                  <CloudUpload className="size-4" aria-hidden />
+                  Upload file
+                </TabsTrigger>
+                <TabsTrigger value="link">
+                  <FileText className="size-4" aria-hidden />
+                  Register link only
+                </TabsTrigger>
+              </TabsList>
+              <TabsContent value="upload" className="flex flex-col gap-4 pt-2">
+                <div className="flex flex-col gap-2">
+                  <Label htmlFor="doc-file">File</Label>
+                  <Input
+                    id="doc-file"
+                    type="file"
+                    accept={ACCEPT_MIME}
+                    onChange={(e) => {
+                      const picked = e.target.files?.[0] ?? null
+                      if (!picked) {
+                        setFile(null)
+                        setFileError(null)
+                        return
+                      }
+                      // M13-ui: client-side MIME validation (declared type first,
+                      // extension fallback for browsers that report empty types).
+                      if (!isAllowedClientFile(picked)) {
+                        setFile(null)
+                        setFileError(`Unsupported file type. Allowed: PDF, images, Office docs, text/CSV, ZIP or JSON.`)
+                        // reset the input so the same file can be re-picked after a fix
+                        e.target.value = ''
+                        return
+                      }
+                      // M12-ui: surface oversize error inline as well (the submit
+                      // button also stays disabled when this is true).
+                      if (picked.size > MAX_FILE_BYTES) {
+                        setFileError(`File is ${fmtSize(picked.size)} — exceeds the 25 MB limit.`)
+                      } else {
+                        setFileError(null)
+                      }
+                      setFile(picked)
+                      setForm((f) => ({ ...f, name: picked.name }))
+                    }}
+                    aria-label="Choose a file to upload"
+                    aria-invalid={!!fileError || undefined}
+                    aria-describedby={fileError ? 'doc-file-error' : undefined}
+                  />
+                  {file && (
+                    <p className="text-xs text-muted-foreground">
+                      {file.name} · {fmtSize(file.size)}
+                      {file.size > MAX_FILE_BYTES && (
+                        <span className="font-medium text-destructive"> — exceeds the 25 MB limit</span>
+                      )}
+                    </p>
+                  )}
+                  {/* M12-ui/M13-ui: inline file-picker error. */}
+                  {fileError && (
+                    <p id="doc-file-error" role="alert" className="text-xs font-medium text-destructive">
+                      {fileError}
+                    </p>
+                  )}
+                  <p className="text-xs text-muted-foreground">
+                    PDF, images, Office docs, text/CSV, ZIP or JSON — up to 25 MB, counted against your plan storage.
+                  </p>
+                </div>
+                <div className="flex flex-col gap-2">
+                  <Label htmlFor="doc-notes">Notes (optional)</Label>
+                  <Textarea
+                    id="doc-notes"
+                    value={form.notes}
+                    onChange={(e) => setForm((f) => ({ ...f, notes: e.target.value }))}
+                    placeholder="e.g. Signed copy — v2 supersedes v1"
+                    rows={2}
+                  />
+                </div>
+              </TabsContent>
+              <TabsContent value="link" className="grid gap-4 pt-2 sm:grid-cols-2">
+                <div className="flex flex-col gap-2">
+                  <Label>File type</Label>
+                  <Select value={form.kind} onValueChange={(v) => setForm((f) => ({ ...f, kind: v as DocKind }))}>
+                    <SelectTrigger className="w-full" aria-label="File type">
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      {MIMETYPE_OPTIONS.map((o) => (
+                        <SelectItem key={o.value} value={o.value}>
+                          {o.label}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                </div>
+                <div className="flex flex-col gap-2">
+                  <Label htmlFor="doc-size">Size (KB)</Label>
+                  <Input
+                    id="doc-size"
+                    type="number"
+                    min="0"
+                    value={form.sizeKb}
+                    onChange={(e) => setForm((f) => ({ ...f, sizeKb: e.target.value }))}
+                    placeholder="e.g. 240"
+                  />
+                </div>
+                <p className="text-xs text-muted-foreground sm:col-span-2">
+                  Registers metadata only — no file is stored, so there is nothing to download for this entry.
+                </p>
+              </TabsContent>
+            </Tabs>
+            <div className="flex flex-col gap-2">
+              <Label htmlFor="doc-name">File name</Label>
+              <Input
+                id="doc-name"
+                value={form.name}
+                onChange={(e) => setForm((f) => ({ ...f, name: e.target.value }))}
+                placeholder="e.g. MSA — Acme (signed).pdf"
+              />
+            </div>
+            <div className="grid gap-4 sm:grid-cols-2">
+              <div className="flex flex-col gap-2">
+                <Label>Folder</Label>
+                <Select
+                  value={form.folderChoice}
+                  onValueChange={(v) => setForm((f) => ({ ...f, folderChoice: v }))}
+                >
+                  <SelectTrigger className="w-full" aria-label="Select folder">
+                    <SelectValue placeholder="General" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value={DEFAULT_FOLDER}>General (default)</SelectItem>
+                    {folders.map((f) => (
+                      <SelectItem key={f} value={f}>
+                        {f}
+                      </SelectItem>
+                    ))}
+                    <SelectItem value={NEW_FOLDER}>New folder…</SelectItem>
+                  </SelectContent>
+                </Select>
+                {form.folderChoice === NEW_FOLDER && (
+                  <Input
+                    value={form.newFolder}
+                    onChange={(e) => setForm((f) => ({ ...f, newFolder: e.target.value }))}
+                    placeholder="New folder name"
+                    aria-label="New folder name"
+                  />
+                )}
+              </div>
+              <div className="flex flex-col gap-2">
+                <Label>Project (optional)</Label>
+                <Select
+                  value={form.projectId}
+                  onValueChange={(v) => setForm((f) => ({ ...f, projectId: v }))}
+                >
+                  <SelectTrigger className="w-full" aria-label="Link to project">
+                    <SelectValue placeholder="No project" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value={NO_PROJECT}>No project</SelectItem>
+                    {projects.map((p) => (
+                      <SelectItem key={p.id} value={p.id}>
+                        {p.name}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </div>
+            </div>
+            <div className="flex items-start gap-2.5 rounded-lg border border-dashed bg-muted/40 p-3 text-xs text-muted-foreground">
+              <Info className="mt-0.5 size-4 shrink-0 text-emerald-600 dark:text-emerald-400" aria-hidden />
+              <p>
+                Uploaded files are stored per organization — locally in the sandbox, on Cloudflare R2 in production —
+                and count against your plan's storage quota.
+              </p>
+            </div>
+          </div>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setUploadOpen(false)} disabled={saving}>
+              Cancel
+            </Button>
+            <Button
+              onClick={submitUpload}
+              disabled={saving || (mode === 'upload' && !file) || (mode === 'upload' && !!file && file.size > MAX_FILE_BYTES) || !!fileError}
+            >
+              {saving ? (
+                <Loader2 className="size-4 animate-spin" aria-hidden />
+              ) : (
+                <CloudUpload className="size-4" aria-hidden />
+              )}
+              {saving ? (mode === 'upload' ? 'Uploading…' : 'Registering…') : mode === 'upload' ? 'Upload' : 'Register'}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* details dialog */}
+      <Dialog open={!!detailsDoc} onOpenChange={(open) => !open && setDetailsDoc(null)}>
+        <DialogContent className="sm:max-w-lg">
+          {detailsDoc && (
+            <>
+              <DialogHeader>
+                <DialogTitle className="truncate pr-8 text-base">{detailsDoc.name}</DialogTitle>
+                <DialogDescription>Document metadata</DialogDescription>
+              </DialogHeader>
+              <dl className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+                <div>
+                  <dt className="text-xs font-medium uppercase tracking-wide text-muted-foreground">Folder</dt>
+                  <dd className="mt-0.5 text-sm font-medium">{detailsDoc.folder}</dd>
+                </div>
+                <div>
+                  <dt className="text-xs font-medium uppercase tracking-wide text-muted-foreground">Project</dt>
+                  <dd className="mt-0.5 inline-flex items-center gap-1.5 text-sm font-medium">
+                    {detailsDoc.project ? (
+                      <>
+                        <span
+                          className="size-2 rounded-full"
+                          style={{ backgroundColor: detailsDoc.project.color ?? '#10b981' }}
+                          aria-hidden
+                        />
+                        {detailsDoc.project.name}
+                      </>
+                    ) : (
+                      '—'
+                    )}
+                  </dd>
+                </div>
+                <div>
+                  <dt className="text-xs font-medium uppercase tracking-wide text-muted-foreground">Type</dt>
+                  <dd className="mt-0.5 text-sm font-medium">
+                    {detailsDoc.mimeType ?? KIND_META[docKind(detailsDoc.mimeType, detailsDoc.name)].label}
+                  </dd>
+                </div>
+                <div>
+                  <dt className="text-xs font-medium uppercase tracking-wide text-muted-foreground">Size</dt>
+                  <dd className="mt-0.5 text-sm font-medium">{fmtSize(detailsDoc.size)}</dd>
+                </div>
+                <div>
+                  <dt className="text-xs font-medium uppercase tracking-wide text-muted-foreground">Version</dt>
+                  <dd className="mt-0.5 text-sm font-medium">v{detailsDoc.version}</dd>
+                </div>
+                <div>
+                  <dt className="text-xs font-medium uppercase tracking-wide text-muted-foreground">Uploaded</dt>
+                  <dd className="mt-0.5 text-sm font-medium">
+                    {fmtDate(detailsDoc.createdAt)}{' '}
+                    <span className="font-normal text-muted-foreground">({relativeTime(detailsDoc.createdAt)})</span>
+                  </dd>
+                </div>
+                <div className="sm:col-span-2">
+                  <dt className="text-xs font-medium uppercase tracking-wide text-muted-foreground">Uploaded by</dt>
+                  <dd className="mt-1 flex items-center gap-2">
+                    <UserAvatar
+                      name={detailsDoc.uploadedByName}
+                      avatarUrl={detailsDoc.uploadedBy?.user.avatarUrl}
+                      size="sm"
+                    />
+                    <div className="min-w-0">
+                      <p className="text-sm font-medium">{detailsDoc.uploadedByName ?? 'Former member'}</p>
+                      {detailsDoc.uploadedBy?.title && (
+                        <p className="truncate text-xs text-muted-foreground">{detailsDoc.uploadedBy.title}</p>
+                      )}
+                    </div>
+                  </dd>
+                </div>
+              </dl>
+              <div className="rounded-lg bg-muted p-3">
+                <p className="mb-1 text-xs font-medium uppercase tracking-wide text-muted-foreground">
+                  Storage
+                </p>
+                {detailsDoc.storageKey ? (
+                  <code className="break-all font-mono text-xs">{detailsDoc.storageKey}</code>
+                ) : (
+                  <p className="text-xs text-muted-foreground">
+                    Metadata only — no file stored for this entry.
+                  </p>
+                )}
+              </div>
+              <DialogFooter>
+                <div className="mr-auto flex flex-wrap items-center gap-2">
+                  {detailsDoc.storageKey && (
+                    <Button asChild>
+                      <a href={`/api/documents/${detailsDoc.id}/download`} download>
+                        <Download className="size-4" aria-hidden />
+                        Download
+                      </a>
+                    </Button>
+                  )}
+                  {canEditDoc && (
+                    <>
+                      <Button variant="outline" onClick={() => openRename(detailsDoc)}>
+                        <Pencil className="size-4" aria-hidden />
+                        Rename
+                      </Button>
+                      <Button variant="outline" onClick={() => openMove(detailsDoc)}>
+                        <FolderInput className="size-4" aria-hidden />
+                        Move
+                      </Button>
+                    </>
+                  )}
+                  {canDelete(detailsDoc) && (
+                    <Button
+                      variant="outline"
+                      className="text-destructive hover:text-destructive"
+                      onClick={() => setDeleteDoc(detailsDoc)}
+                    >
+                      <Trash2 className="size-4" aria-hidden />
+                      Delete
+                    </Button>
+                  )}
+                </div>
+                <Button variant="outline" onClick={() => setDetailsDoc(null)}>
+                  Close
+                </Button>
+              </DialogFooter>
+            </>
+          )}
+        </DialogContent>
+      </Dialog>
+
+      {/* delete confirm */}
+      <AlertDialog open={!!deleteDoc} onOpenChange={(open) => !open && setDeleteDoc(null)}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Delete this document?</AlertDialogTitle>
+            <AlertDialogDescription>
+              “{deleteDoc?.name}” will be removed from the library for every member of the organization. This
+              action cannot be undone.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel disabled={deleting}>Cancel</AlertDialogCancel>
+            <AlertDialogAction
+              onClick={(e) => {
+                e.preventDefault()
+                void confirmDelete()
+              }}
+              className="bg-destructive text-white hover:bg-destructive/90"
+              disabled={deleting}
+            >
+              {deleting ? 'Deleting…' : 'Delete document'}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+
+      {/* rename dialog */}
+      <Dialog open={!!renameDoc} onOpenChange={(open) => !open && setRenameDoc(null)}>
+        <DialogContent className="sm:max-w-md">
+          <DialogHeader>
+            <DialogTitle>Rename document</DialogTitle>
+            <DialogDescription>Give the file a new name. The stored bytes are not affected.</DialogDescription>
+          </DialogHeader>
+          <div className="flex flex-col gap-2">
+            <Label htmlFor="doc-rename">File name</Label>
+            <Input
+              id="doc-rename"
+              value={renameName}
+              onChange={(e) => setRenameName(e.target.value)}
+              placeholder="e.g. MSA — Acme (signed).pdf"
+              autoFocus
+              onKeyDown={(e) => {
+                if (e.key === 'Enter') {
+                  e.preventDefault()
+                  void submitRename()
+                }
+              }}
+            />
+            {renameName.trim().length > 255 && (
+              <p className="text-xs text-destructive">Name must be 255 characters or fewer.</p>
+            )}
+          </div>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setRenameDoc(null)} disabled={renameSaving}>
+              Cancel
+            </Button>
+            <Button
+              onClick={() => void submitRename()}
+              disabled={renameSaving || !renameName.trim() || renameName.trim().length > 255}
+            >
+              {renameSaving ? (
+                <Loader2 className="size-4 animate-spin" aria-hidden />
+              ) : (
+                <Pencil className="size-4" aria-hidden />
+              )}
+              {renameSaving ? 'Saving…' : 'Save name'}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* move-to-project dialog */}
+      <Dialog open={!!moveDoc} onOpenChange={(open) => !open && setMoveDoc(null)}>
+        <DialogContent className="sm:max-w-md">
+          <DialogHeader>
+            <DialogTitle>Move document</DialogTitle>
+            <DialogDescription>
+              Re-file “{moveDoc?.name}” under a different project, or unfile it.
+            </DialogDescription>
+          </DialogHeader>
+          <div className="flex flex-col gap-2">
+            <Label htmlFor="doc-move">Project</Label>
+            <Select value={moveProjectId} onValueChange={setMoveProjectId}>
+              <SelectTrigger id="doc-move" className="w-full" aria-label="Move to project">
+                <SelectValue placeholder="Select project" />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value={NO_PROJECT}>No project (unfiled)</SelectItem>
+                {projects.map((p) => (
+                  <SelectItem key={p.id} value={p.id}>
+                    {p.name}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+            {projects.length === 0 && (
+              <p className="text-xs text-muted-foreground">No projects available — pick “unfiled” to clear the link.</p>
+            )}
+          </div>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setMoveDoc(null)} disabled={moveSaving}>
+              Cancel
+            </Button>
+            <Button onClick={() => void submitMove()} disabled={moveSaving}>
+              {moveSaving ? (
+                <Loader2 className="size-4 animate-spin" aria-hidden />
+              ) : (
+                <FolderInput className="size-4" aria-hidden />
+              )}
+              {moveSaving ? 'Moving…' : 'Move document'}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+    </div>
+  )
+}
