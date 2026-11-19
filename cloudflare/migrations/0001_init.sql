@@ -394,6 +394,7 @@ CREATE TABLE "Lead" (
     "convertedCompanyId" TEXT,
     "createdAt" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
     "updatedAt" DATETIME NOT NULL,
+    "deletedAt" DATETIME,
     CONSTRAINT "Lead_orgId_fkey" FOREIGN KEY ("orgId") REFERENCES "Organization" ("id") ON DELETE CASCADE ON UPDATE CASCADE,
     CONSTRAINT "Lead_ownerMembershipId_fkey" FOREIGN KEY ("ownerMembershipId") REFERENCES "Membership" ("id") ON DELETE SET NULL ON UPDATE CASCADE,
     CONSTRAINT "Lead_convertedCompanyId_fkey" FOREIGN KEY ("convertedCompanyId") REFERENCES "Company" ("id") ON DELETE SET NULL ON UPDATE CASCADE

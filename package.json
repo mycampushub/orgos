@@ -13,11 +13,13 @@
     "db:generate": "prisma generate",
     "db:migrate": "prisma migrate dev",
     "db:reset": "prisma migrate reset",
-    "cf:generate": "prisma generate --schema cloudflare/schema.workers.prisma",
+    "db:sql": "prisma migrate diff --from-empty --to-schema-datamodel prisma/schema.prisma --script > cloudflare/migrations/0001_init.sql",
     "cf:build": "opennextjs-cloudflare build",
     "cf:deploy": "opennextjs-cloudflare build && wrangler deploy",
     "cf:dev": "opennextjs-cloudflare dev",
-    "cf:d1:migrate:remote": "wrangler d1 execute orgos --remote --file cloudflare/migrations/0001_init.sql"
+    "cf:d1:migrate:remote": "wrangler d1 execute orgos --remote --file cloudflare/migrations/0001_init.sql",
+    "cf:d1:migrate:remote:upgrade": "wrangler d1 execute orgos --remote --file cloudflare/migrations/0002_add_soft_delete.sql",
+    "db:verify:d1": "bun scripts/verify-d1.ts"
   },
   "dependencies": {
     "@dnd-kit/core": "^6.3.1",

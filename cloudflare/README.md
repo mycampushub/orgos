@@ -1,9 +1,34 @@
 # OrgOS — Cloudflare Deployment
 
-The canonical Wrangler configuration lives at the **repository root** (`wrangler.jsonc`) —
+The canonical Wrangler configuration lives at the **repository root** (`wrangler.toml`) —
 it is the single source of truth for the main OpenNext worker. The only other config in
-this folder is `cron-wrangler.jsonc` (the companion cron worker). There is no
-`wrangler.toml` and no duplicate main-worker config.
+this folder is `cron-wrangler.jsonc` (the companion cron worker).
+
+## Single source of truth for the schema
+
+`prisma/schema.prisma` is THE schema. Everything else is a derived artifact:
+
+| Artifact | How it's produced | When to regenerate |
+| -------- | ----------------- | ------------------ |
+| Prisma Client (`node_modules/@prisma/client`) | `bun run db:generate` (runs on `bun install`) | on every schema change |
+| Local SQLite (`db/custom.db`) | `bun run db:push` | on every schema change |
+| D1 SQL (`cloudflare/migrations/0001_init.sql`) | `bun run db:sql` | on every schema change |
+
+There is no second Prisma schema and no hand-maintained SQL — editing
+`prisma/schema.prisma` and running `bun run db:sql` is the whole workflow.
+
+## How the dual runtime works (no per-route branching)
+
+`src/lib/db.ts` exposes one `db` object (a lazy Proxy) to all ~50 API routes:
+
+- **Node (`bun run dev`)**: plain `PrismaClient` + binary engine against the local
+  SQLite file. `CF_WORKER` is unset → this is the local path.
+- **Workers (`cf:deploy`)**: `wrangler.toml` sets `CF_WORKER=1` → `db` detects the
+  OpenNext request context, wraps `env.DATABASE` in the `PrismaD1` driver adapter and
+  switches Prisma to its WASM engine. Same `db.lead.findMany(...)` calls, same
+  soft-delete extension, zero route changes.
+
+D1 **is** SQLite (same dialect, same file format), which is why one schema serves both.
 
 ## Resources
 
@@ -15,65 +40,50 @@ this folder is `cron-wrangler.jsonc` (the companion cron worker). There is no
 | `CACHE`    | KV namespace                 | Dashboard aggregates, pipeline summaries (reserved)            |
 
 Storage is dual-mode (`src/lib/server/storage.ts`): local disk under `db/uploads/` in
-the sandbox, and the `BUCKET` R2 binding on Workers when the `CF_WORKER=1` var is set
-(it is, in `wrangler.jsonc` `vars`).
+local dev, and the `BUCKET` R2 binding on Workers (`CF_WORKER=1` in `wrangler.toml` vars).
 
-## Deploy (honest, step-by-step)
+## Deploy (step-by-step)
 
 ```bash
-# 1. Toolchain (dev deps are enough for the build)
-bun add -d @opennextjs/cloudflare wrangler @prisma/adapter-d1
-
-# 2. Generate the Workers/D1 Prisma client
-#    (cloudflare/schema.workers.prisma = schema copy with the new `prisma-client`
-#     generator: driverAdapters + queryCompiler, output cloudflare/generated/prisma)
-bunx prisma generate --schema cloudflare/schema.workers.prisma
-
-# 3. Create the D1 database, paste its id into wrangler.jsonc (DATABASE binding),
-#    then apply the SQL schema (optionally the demo seed too)
-npx wrangler d1 create orgos
+# 1. Fresh D1 + resources
+npx wrangler d1 create orgos            # paste the id into wrangler.toml (DATABASE binding)
 npx wrangler r2 bucket create orgos-documents
 npx wrangler kv namespace create SESSIONS
 npx wrangler kv namespace create CACHE
-bun run cf:d1:migrate:remote          # wrangler d1 execute orgos --remote --file cloudflare/migrations/0001_init.sql
+
+# 2. Apply the schema (generated from prisma/schema.prisma — see `bun run db:sql`)
+bun run cf:d1:migrate:remote
 # optional demo data:
 npx wrangler d1 execute orgos --remote --file cloudflare/seed/seed-demo.sql
 
-# 4. Build for the Workers runtime and deploy
-bun run cf:build                      # opennextjs-cloudflare build
-bun run cf:deploy                     # opennextjs-cloudflare build && wrangler deploy
+# 3. Build for the Workers runtime and deploy
+bun run cf:deploy                       # opennextjs-cloudflare build && wrangler deploy
 # local preview against the Workers runtime:
-bun run cf:dev                        # opennextjs-cloudflare dev
+bun run cf:dev                          # opennextjs-cloudflare dev
 
-# 5. Secrets + the companion cron worker
-npx wrangler secret put APP_SECRET    # session signing pepper
-npx wrangler secret put CRON_SECRET   # shared secret for POST /api/cron/daily
+# 4. Secrets + the companion cron worker
+npx wrangler secret put APP_SECRET      # session signing pepper
+npx wrangler secret put CRON_SECRET     # shared secret for POST /api/cron/daily
 npx wrangler deploy --config cloudflare/cron-wrangler.jsonc
-npx wrangler secret put CRON_SECRET --config cloudflare/cron-wrangler.jsonc
-npx wrangler secret put APP_URL --config cloudflare/cron-wrangler.jsonc   # https://<your-orgos-workers-domain>
-
-# 6. Storage: CF_WORKER=1 is already set in wrangler.jsonc `vars`
-#    → src/lib/server/storage.ts lazily resolves getCloudflareContext().env.BUCKET
-#      (R2) and uses the local disk only as a fallback.
 ```
 
-## Known limitation (be aware before deploying)
+### Already deployed before the soft-delete migration?
 
-`src/lib/db.ts` still constructs the plain local `PrismaClient` — the D1 driver-adapter
-wiring is NOT applied in the committed code. At deploy time you must wire it following
-the snippet in `cloudflare/snippets/db-d1.ts` (`PrismaD1(env.DATABASE)` + the client
-generated from `cloudflare/schema.workers.prisma`), either by editing `src/lib/db.ts`
-behind the `CF_WORKER` flag or via the OpenNext worker entry. Until that wiring is done,
-a deployed worker will not successfully query D1 — everything else (routes, R2 storage,
-quota enforcement) is deploy-ready.
+If your remote D1 was created with the pre-soft-delete `0001_init.sql` (before
+`deletedAt` existed), apply the incremental migration instead of re-creating:
+
+```bash
+bun run cf:d1:migrate:remote:upgrade    # adds the 8 missing "deletedAt" columns
+```
+
+Fresh databases can skip this — `0001_init.sql` already includes `deletedAt`.
 
 ## Layout
 
-- `wrangler.jsonc` (repo root) — canonical Wrangler config for the main worker (no cron trigger on it)
-- `cloudflare/cron-wrangler.jsonc` + `cloudflare/cron-worker.ts` — dedicated daily-schedule companion worker
-- `cloudflare/schema.workers.prisma` — Prisma schema copy for the Workers/D1 build path (new `prisma-client` generator)
-- `cloudflare/migrations/0001_init.sql` — D1 schema (SQLite-compatible, generated from the Prisma datamodel)
+- `wrangler.toml` (repo root) — canonical Wrangler config for the main worker
+- `cloudflare/cron-wrangler.jsonc` + `cloudflare/cron-worker.ts` — daily-schedule companion worker
+- `cloudflare/migrations/0001_init.sql` — full D1 schema (generated artifact, `bun run db:sql`)
+- `cloudflare/migrations/0002_add_soft_delete.sql` — incremental upgrade for pre-existing D1 databases
 - `cloudflare/seed/seed-demo.sql` — optional demo data
-- `cloudflare/snippets/db-d1.ts` — the D1 adapter wiring reference for `src/lib/db.ts` (deploy-time)
 - `cloudflare/env.d.ts` — `CloudflareEnv` typings for the bindings
-- `cloudflare/generated/` — Prisma client output (gitignored)
+- `scripts/verify-d1.ts` — runs the real PrismaD1 adapter against a local (miniflare) D1 with the migration SQL, proving the Workers path without deploying: `bun run db:verify:d1`
