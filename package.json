@@ -19,7 +19,9 @@
     "cf:dev": "opennextjs-cloudflare dev",
     "cf:d1:migrate:remote": "wrangler d1 execute orgos --remote --file cloudflare/migrations/0001_init.sql",
     "cf:d1:migrate:remote:upgrade": "wrangler d1 execute orgos --remote --file cloudflare/migrations/0002_add_soft_delete.sql",
-    "db:verify:d1": "bun scripts/verify-d1.ts"
+    "db:verify:d1": "bun scripts/verify-d1.ts",
+    "db:export:seed": "bun scripts/export-d1-seed.ts",
+    "db:repro:d1": "bun scripts/repro-d1-500s.ts"
   },
   "dependencies": {
     "@dnd-kit/core": "^6.3.1",
@@ -89,7 +91,7 @@
   },
   "devDependencies": {
     "@opennextjs/cloudflare": "^1.20.6",
-    "@prisma/adapter-d1": "^7.10.0",
+    "@prisma/adapter-d1": "6.19.3",
     "@tailwindcss/postcss": "^4",
     "@types/react": "^19",
     "@types/react-dom": "^19",
