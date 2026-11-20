@@ -16,7 +16,7 @@ binding = "ASSETS"
 [[d1_databases]]
 binding = "DATABASE"
 database_name = "orgos"
-database_id = "4a7a1812-314b-4ec9-ac05-793ccaa61cee"
+database_id = "d43ee46b-7e16-47ea-b59d-fbee1e1e41c8"
 migrations_dir = "cloudflare/migrations"
 migrations_table = "__cf_d1_migrations"
 
