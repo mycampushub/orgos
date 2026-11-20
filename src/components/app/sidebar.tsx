@@ -291,7 +291,7 @@ function SidebarInner({ onNavigate }: { onNavigate?: () => void }) {
   )
 }
 
-/** Desktop fixed sidebar. Mobile navigation lives in the topbar (AppMobileNav). */
+/** Desktop fixed sidebar. Mobile navigation: top bar (AppMobileNav) + bottom tab bar (AppBottomNav). */
 export function AppSidebar() {
   return (
     <aside className="fixed inset-y-0 left-0 z-40 hidden w-64 border-r border-white/10 lg:block" aria-label="Sidebar">
@@ -318,5 +318,54 @@ export function AppMobileNav() {
         </SheetContent>
       </Sheet>
     </div>
+  )
+}
+
+/** Quick-access modules pinned to the bottom bar on mobile. */
+const BOTTOM_NAV: NavItem[] = [
+  { id: 'my-day', label: 'My Workspace', icon: Sun },
+  { id: 'my-tasks', label: 'My Tasks', icon: CheckSquare },
+  { id: 'meetings', label: 'Meetings', icon: Video },
+  { id: 'projects', label: 'Projects', icon: FolderKanban },
+]
+
+/** Mobile bottom tab bar (lg:hidden): the four most-used modules as large
+ *  touch targets. Org-less platform admins live in the console — no bar. */
+export function AppBottomNav() {
+  const { nav, navigate, me, canView } = useWorkspace()
+  if (!me?.activeOrgId) return null
+
+  const items = BOTTOM_NAV.filter((item) => canView(item.id))
+  if (items.length === 0) return null
+
+  return (
+    <nav
+      aria-label="Quick navigation"
+      className="fixed inset-x-0 bottom-0 z-30 border-t bg-card/95 backdrop-blur supports-[backdrop-filter]:bg-card/80 lg:hidden"
+      style={{ paddingBottom: 'env(safe-area-inset-bottom)' }}
+    >
+      <div className="grid grid-flow-col auto-cols-fr">
+        {items.map((item) => {
+          const Icon = item.icon
+          const active = nav.module === item.id
+          return (
+            <button
+              key={item.id}
+              onClick={() => navigate(item.id)}
+              aria-current={active ? 'page' : undefined}
+              className={cn(
+                'flex min-h-[56px] flex-col items-center justify-center gap-1 px-1 py-2 text-[10px] font-medium transition-colors',
+                active
+                  ? 'text-emerald-600 dark:text-emerald-400'
+                  : 'text-muted-foreground hover:bg-muted/50 hover:text-foreground'
+              )}
+            >
+              <Icon className={cn('size-5 shrink-0', active && 'text-emerald-600 dark:text-emerald-400')} aria-hidden />
+              <span className="max-w-full truncate">{item.label}</span>
+            </button>
+          )
+        })}
+      </div>
+    </nav>
   )
 }

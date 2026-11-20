@@ -2,7 +2,7 @@
 
 import { useEffect, useRef } from 'react'
 import { useWorkspace, type MeShape } from '@/lib/client/store'
-import { AppSidebar, AppMobileNav } from './sidebar'
+import { AppSidebar, AppMobileNav, AppBottomNav } from './sidebar'
 import { AppTopbar } from './topbar'
 import { ErrorBoundary } from './error-boundary'
 import { Button } from '@/components/ui/button'
@@ -168,16 +168,14 @@ export function WorkspaceShell() {
         <AppMobileNav />
         <AppTopbar />
         {impersonatedBy && <SupportSessionBanner impersonatedBy={impersonatedBy} />}
-        <main id="content" className="flex-1 px-4 py-5 sm:px-6 lg:px-8">
+        <main id="content" className="flex-1 px-4 pb-24 pt-5 sm:px-6 lg:px-8 lg:pb-8">
           <div className="mx-auto w-full max-w-7xl">
             <ErrorBoundary key={nav.module + (nav.params?.projectId ?? '')}>
               <View />
             </ErrorBoundary>
           </div>
         </main>
-        <footer className="mt-auto border-t bg-card px-6 py-3 text-center text-[11px] text-muted-foreground">
-          OrgOS — The Organization Operating System · Multi-tenant enterprise SaaS
-        </footer>
+        <AppBottomNav />
       </div>
     </div>
   )
